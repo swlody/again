@@ -9,10 +9,10 @@ use std::{
     ptr,
 };
 use winapi::{
-    shared::{minwindef::*, windef::*, winerror::*},
+    shared::{minwindef::*, mmreg::*, windef::*, winerror::*},
     um::{
-        debugapi::OutputDebugStringW, libloaderapi::GetModuleHandleW, wingdi::*, winuser::*,
-        xinput::*,
+        debugapi::OutputDebugStringW, dsound::*, libloaderapi::GetModuleHandleW, wingdi::*,
+        winuser::*, xinput::*,
     },
 };
 
@@ -33,14 +33,14 @@ struct Pixel {
 }
 
 #[cfg(windows)]
-struct Buffer {
+struct DisplayBuffer {
     info: BITMAPINFO,
     memory: Vec<Pixel>,
     current_offset: i32,
 }
 
 #[cfg(windows)]
-impl Buffer {
+impl DisplayBuffer {
     fn step_render(&mut self, step_by: i32) {
         let width = self.info.bmiHeader.biWidth;
         let height = self.info.bmiHeader.biHeight;
@@ -83,8 +83,8 @@ impl Buffer {
             0,
             self.info.bmiHeader.biWidth,
             self.info.bmiHeader.biHeight,
-            self.memory.as_ptr() as *const winapi::ctypes::c_void,
-            &self.info as *const BITMAPINFO,
+            self.memory.as_ptr() as *const _,
+            &self.info as *const _,
             DIB_RGB_COLORS,
             SRCCOPY,
         );
@@ -95,7 +95,7 @@ impl Buffer {
 const_assert!(std::mem::size_of::<BITMAPINFOHEADER>() < u32::max_value() as usize);
 
 #[cfg(windows)]
-static mut BUFFER: Buffer = Buffer {
+static mut DISPLAY_BUFFER: DisplayBuffer = DisplayBuffer {
     info: BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -156,6 +156,72 @@ unsafe fn handle_key_press(vk_code: WPARAM, l_param: LPARAM) {
     }
 }
 
+// oh jeez
+#[cfg(windows)]
+fn initialize_direct_sound(window: HWND, buffer_size: DWORD, samples_per_second: DWORD) {
+    unsafe {
+        let mut direct_sound_ptr = MaybeUninit::<LPDIRECTSOUND>::uninit();
+        if DirectSoundCreate(ptr::null(), direct_sound_ptr.as_mut_ptr(), ptr::null_mut()) == DS_OK {
+            let direct_sound = direct_sound_ptr.assume_init().as_ref().unwrap();
+
+            let mut wav_format = WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_PCM,
+                nChannels: 2,
+                nSamplesPerSec: samples_per_second,
+                wBitsPerSample: 16,
+                ..Default::default()
+            };
+            wav_format.nBlockAlign = (wav_format.nChannels * wav_format.wBitsPerSample) / 8;
+            wav_format.nAvgBytesPerSec =
+                wav_format.nSamplesPerSec * wav_format.nBlockAlign as DWORD;
+
+            if direct_sound.SetCooperativeLevel(window, DSSCL_PRIORITY) == DS_OK {
+                let mut sound_buffer_ptr = MaybeUninit::<LPDIRECTSOUNDBUFFER>::uninit();
+                let buffer_description = DSBUFFERDESC {
+                    dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
+                    dwFlags: DSBCAPS_PRIMARYBUFFER,
+                    ..Default::default()
+                };
+
+                if direct_sound.CreateSoundBuffer(
+                    &buffer_description as *const _,
+                    sound_buffer_ptr.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) == DS_OK
+                {
+                    let sound_buffer = sound_buffer_ptr.assume_init().as_ref().unwrap();
+                    if sound_buffer.SetFormat(&wav_format as *const _) != DS_OK {
+                        todo!();
+                    }
+                } else {
+                    todo!();
+                }
+            } else {
+                todo!();
+            }
+
+            let secondary_buffer_description = DSBUFFERDESC {
+                dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
+                dwBufferBytes: buffer_size,
+                lpwfxFormat: &mut wav_format as *mut _,
+                ..Default::default()
+            };
+            let mut secondary_sound_buffer_ptr = MaybeUninit::<LPDIRECTSOUNDBUFFER>::uninit();
+            if direct_sound.CreateSoundBuffer(
+                &secondary_buffer_description as *const _,
+                secondary_sound_buffer_ptr.as_mut_ptr(),
+                ptr::null_mut(),
+            ) == DS_OK
+            {
+            } else {
+                todo!();
+            }
+        } else {
+            todo!();
+        }
+    }
+}
+
 #[cfg(windows)]
 /// `unsafe` precondition: must be called from main thread
 unsafe extern "system" fn main_window_callback(
@@ -164,7 +230,7 @@ unsafe extern "system" fn main_window_callback(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    BUFFER.resize_dib_section(1280, 720);
+    DISPLAY_BUFFER.resize_dib_section(1280, 720);
 
     let mut result = 0;
     match message {
@@ -177,8 +243,8 @@ unsafe extern "system" fn main_window_callback(
             let device_context = BeginPaint(window, paint.as_mut_ptr());
             let paint = paint.assume_init();
             let dimension = get_window_dimension(window);
-            BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
-            EndPaint(window, &paint as *const PAINTSTRUCT);
+            DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
+            EndPaint(window, &paint as *const _);
         }
 
         _ => result = DefWindowProcW(window, message, w_param, l_param),
@@ -228,6 +294,12 @@ fn main() -> Result<()> {
         return Err(Error::last_os_error());
     }
 
+    initialize_direct_sound(
+        window,
+        48000 * std::mem::size_of::<WORD>() as u32 * 2,
+        48000,
+    );
+
     unsafe {
         RUNNING = true;
         while RUNNING {
@@ -238,8 +310,8 @@ fn main() -> Result<()> {
                     RUNNING = false;
                 }
 
-                TranslateMessage(&message as *const MSG);
-                DispatchMessageW(&message as *const MSG);
+                TranslateMessage(&message as *const _);
+                DispatchMessageW(&message as *const _);
             }
 
             // Handle gamepad input
@@ -259,8 +331,8 @@ fn main() -> Result<()> {
             let device_context = GetDC(window);
             let dimension = get_window_dimension(window);
             {
-                BUFFER.step_render(1);
-                BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
+                DISPLAY_BUFFER.step_render(1);
+                DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
             }
             ReleaseDC(window, device_context);
         }
