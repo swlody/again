@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate static_assertions;
+
 use std::{
     ffi::OsStr,
     io::{Error, Result},
@@ -6,8 +9,11 @@ use std::{
     ptr,
 };
 use winapi::{
-    shared::{minwindef::*, windef::*},
-    um::{debugapi::OutputDebugStringW, libloaderapi::GetModuleHandleW, wingdi::*, winuser::*},
+    shared::{minwindef::*, windef::*, winerror::*},
+    um::{
+        debugapi::OutputDebugStringW, libloaderapi::GetModuleHandleW, wingdi::*, winuser::*,
+        xinput::*,
+    },
 };
 
 #[cfg(windows)]
@@ -42,7 +48,7 @@ impl Buffer {
 
         assert!(self.memory.len() == height as usize * width as usize);
         for (i, pixel) in self.memory.iter_mut().enumerate() {
-            assert!(i < u32::max_value() as usize);
+            assert!(i < i32::max_value() as usize);
             let x = i as i32 % width;
             let y = i as i32 / height;
             pixel.g = ((x ^ y) - self.current_offset) as u8;
@@ -65,7 +71,7 @@ impl Buffer {
         self.step_render(1);
     }
 
-    /// Requires that device_context is a valid device context and that info is valid
+    /// Requires that `device_context` is a valid device context and that info is valid
     unsafe fn draw_to_window(&self, device_context: HDC, window_width: i32, window_height: i32) {
         StretchDIBits(
             device_context,
@@ -84,6 +90,9 @@ impl Buffer {
         );
     }
 }
+
+#[cfg(windows)]
+const_assert!(std::mem::size_of::<BITMAPINFOHEADER>() < u32::max_value() as usize);
 
 #[cfg(windows)]
 static mut BUFFER: Buffer = Buffer {
@@ -133,12 +142,22 @@ fn get_window_dimension(window: HWND) -> WindowDimension {
 }
 
 #[cfg(windows)]
-fn handle_key_press(_vk_code: WPARAM, _l_param: LPARAM) {
-    todo!();
+/// `unsafe` precondition: must be called from main thread
+unsafe fn handle_key_press(vk_code: WPARAM, l_param: LPARAM) {
+    assert!(vk_code < i32::max_value() as usize);
+    let _was_down = (l_param & (1 << 30)) != 0;
+    let _is_down = (l_param & (1 << 31)) == 0;
+
+    let alt_key_pressed = (l_param & (1 << 29)) != 0;
+    match vk_code as i32 {
+        VK_ESCAPE => RUNNING = false,
+        VK_F4 if alt_key_pressed => RUNNING = false,
+        _ => (),
+    }
 }
 
 #[cfg(windows)]
-/// Must be called from main thread
+/// `unsafe` precondition: must be called from main thread
 unsafe extern "system" fn main_window_callback(
     window: HWND,
     message: UINT,
@@ -223,8 +242,18 @@ fn main() -> Result<()> {
                 DispatchMessageW(&message as *const MSG);
             }
 
-            if !RUNNING {
-                break;
+            // Handle gamepad input
+            for controller_index in 0..XUSER_MAX_COUNT {
+                let mut controller_state = MaybeUninit::<XINPUT_STATE>::uninit();
+                if XInputGetState(controller_index, controller_state.as_mut_ptr()) == ERROR_SUCCESS
+                {
+                    let controller_state = controller_state.assume_init();
+                    let pad = &controller_state.Gamepad;
+                    let _up_pressed = (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0;
+                    let _stick_x = pad.sThumbLX;
+                } else {
+                    // Controller not available
+                }
             }
 
             let device_context = GetDC(window);
