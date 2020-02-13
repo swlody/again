@@ -15,8 +15,8 @@ use std::os::windows::ffi::OsStrExt;
 use winapi::{
     shared::{minwindef::*, mmreg::*, windef::*, winerror::*},
     um::{
-        debugapi::OutputDebugStringW, dsound::*, libloaderapi::GetModuleHandleW, unknwnbase::*,
-        wingdi::*, winuser::*, xinput::*,
+        debugapi::OutputDebugStringW, dsound::*, libloaderapi::GetModuleHandleW, wingdi::*,
+        winuser::*, xinput::*,
     },
 };
 
@@ -160,85 +160,162 @@ unsafe fn handle_key_press(vk_code: WPARAM, l_param: LPARAM) {
     }
 }
 
-// oh jeez
 #[cfg(windows)]
+#[must_use]
 fn initialize_direct_sound(
     window: HWND,
     buffer_size: u32,
     samples_per_second: u32,
 ) -> (LPDIRECTSOUND, LPDIRECTSOUNDBUFFER, LPDIRECTSOUNDBUFFER) {
-    unsafe {
-        let mut direct_sound_ptr: LPDIRECTSOUND = ptr::null_mut();
-        if DirectSoundCreate(
+    let mut direct_sound_ptr: LPDIRECTSOUND = ptr::null_mut();
+    if unsafe {
+        DirectSoundCreate(
             ptr::null(),
             &mut direct_sound_ptr as *mut _,
             ptr::null_mut(),
-        ) == DS_OK
-        {
-            let direct_sound = direct_sound_ptr.as_ref().unwrap();
-
-            let mut wav_format = WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_PCM,
-                nChannels: 2,
-                nSamplesPerSec: samples_per_second,
-                wBitsPerSample: 16,
-                ..Default::default()
-            };
-            wav_format.nBlockAlign = (wav_format.nChannels * wav_format.wBitsPerSample) / 8;
-            wav_format.nAvgBytesPerSec =
-                wav_format.nSamplesPerSec * wav_format.nBlockAlign as DWORD;
-
-            let mut primary_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
-            if direct_sound.SetCooperativeLevel(window, DSSCL_PRIORITY) == DS_OK {
-                let buffer_description = DSBUFFERDESC {
-                    dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
-                    dwFlags: DSBCAPS_PRIMARYBUFFER,
-                    ..Default::default()
-                };
-
-                if direct_sound.CreateSoundBuffer(
-                    &buffer_description as *const _,
-                    &mut primary_buffer_ptr as *mut _,
-                    ptr::null_mut(),
-                ) == DS_OK
-                {
-                    let primary_buffer = primary_buffer_ptr.as_ref().unwrap();
-                    if primary_buffer.SetFormat(&wav_format as *const _) != DS_OK {
-                        todo!();
-                    }
-                } else {
-                    todo!();
-                }
-            } else {
-                todo!();
-            }
-
-            let secondary_buffer_description = DSBUFFERDESC {
-                dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
-                dwBufferBytes: buffer_size,
-                lpwfxFormat: &mut wav_format as *mut _,
-                ..Default::default()
-            };
-            let mut secondary_sound_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
-            if direct_sound.CreateSoundBuffer(
-                &secondary_buffer_description as *const _,
-                &mut secondary_sound_buffer_ptr as *mut _,
-                ptr::null_mut(),
-            ) == DS_OK
-            {
-                // Successfully allocated our buffers - return their pointers
-                (
-                    direct_sound_ptr,
-                    primary_buffer_ptr,
-                    secondary_sound_buffer_ptr,
-                )
-            } else {
-                todo!();
-            }
-        } else {
-            todo!();
-        }
+        )
+    } != DS_OK
+    {
+        panic!("Failed to create direct sound");
     }
+
+    let direct_sound = unsafe {
+        let direct_sound = direct_sound_ptr.as_ref().unwrap();
+        if direct_sound.SetCooperativeLevel(window, DSSCL_PRIORITY) != DS_OK {
+            panic!("Failed to set direct sound cooperative level")
+        }
+        direct_sound
+    };
+
+    let primary_buffer_description = DSBUFFERDESC {
+        dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
+        dwFlags: DSBCAPS_PRIMARYBUFFER,
+        ..Default::default()
+    };
+    let mut primary_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
+    if unsafe {
+        direct_sound.CreateSoundBuffer(
+            &primary_buffer_description as *const _,
+            &mut primary_buffer_ptr as *mut _,
+            ptr::null_mut(),
+        )
+    } != DS_OK
+    {
+        panic!("Failed to create primary direct sound buffer");
+    }
+    assert!(!primary_buffer_ptr.is_null());
+
+    let mut wav_format = WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM,
+        nChannels: 2,
+        nSamplesPerSec: samples_per_second,
+        wBitsPerSample: 16,
+        ..Default::default()
+    };
+    wav_format.nBlockAlign = (wav_format.nChannels * wav_format.wBitsPerSample) / 8;
+    wav_format.nAvgBytesPerSec = wav_format.nSamplesPerSec * wav_format.nBlockAlign as DWORD;
+
+    if unsafe { (*primary_buffer_ptr).SetFormat(&wav_format as *const _) } != DS_OK {
+        panic!("Failed to set primary sound buffer format");
+    }
+
+    let secondary_buffer_description = DSBUFFERDESC {
+        dwSize: std::mem::size_of::<DSBUFFERDESC>() as DWORD,
+        dwBufferBytes: buffer_size,
+        lpwfxFormat: &mut wav_format as *mut _,
+        ..Default::default()
+    };
+    let mut secondary_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
+    if unsafe {
+        direct_sound.CreateSoundBuffer(
+            &secondary_buffer_description as *const _,
+            &mut secondary_buffer_ptr as *mut _,
+            ptr::null_mut(),
+        )
+    } != DS_OK
+    {
+        panic!("Failed to create secondary sound buffer");
+    }
+    assert!(!secondary_buffer_ptr.is_null());
+
+    // Successfully allocated our buffers - return their pointers
+    (direct_sound_ptr, primary_buffer_ptr, secondary_buffer_ptr)
+}
+
+unsafe fn render_sound_to_buffer(
+    buffer: &IDirectSoundBuffer,
+    sound_buffer_size: u32,
+    running_sample_index: &mut u32,
+    bytes_per_sample: u32,
+    sound_volume: i16,
+    square_wave_period: u32,
+) {
+    let mut play_cursor: DWORD = 0;
+    let mut write_cursor: DWORD = 0;
+    if buffer.GetCurrentPosition(&mut play_cursor as *mut _, &mut write_cursor as *mut _) != DS_OK {
+        panic!("Failed to get current direct sound buffer position");
+    }
+
+    // Output sound
+    let byte_to_lock = (*running_sample_index * bytes_per_sample) % sound_buffer_size;
+    let bytes_to_write = match byte_to_lock.cmp(&play_cursor) {
+        Ordering::Equal => sound_buffer_size,
+        Ordering::Greater => (sound_buffer_size - byte_to_lock) + play_cursor,
+        _ => play_cursor - byte_to_lock,
+    };
+
+    let mut region_1_ptr: LPVOID = ptr::null_mut();
+    let mut region_1_size: DWORD = 0;
+
+    let mut region_2_ptr: LPVOID = ptr::null_mut();
+    let mut region_2_size: DWORD = 0;
+
+    if buffer.Lock(
+        byte_to_lock,
+        bytes_to_write,
+        &mut region_1_ptr as *mut _,
+        &mut region_1_size as *mut _,
+        &mut region_2_ptr as *mut _,
+        &mut region_2_size as *mut _,
+        0,
+    ) != DS_OK
+    {
+        panic!("Failed to lock direct sound buffer");
+    }
+
+    let mut sample_out = region_1_ptr as *mut i16;
+    let region_1_sample_count = region_1_size / bytes_per_sample;
+    for _ in 0..region_1_sample_count {
+        let sample_value = if (*running_sample_index / (square_wave_period / 2)) % 2 == 1 {
+            sound_volume
+        } else {
+            -sound_volume
+        };
+        *running_sample_index += 1;
+
+        *sample_out = sample_value;
+        sample_out = sample_out.add(1);
+        *sample_out = sample_value;
+        sample_out = sample_out.add(1);
+    }
+
+    sample_out = region_2_ptr as *mut i16;
+    let region_2_sample_count = region_2_size / bytes_per_sample;
+    for _ in 0..region_2_sample_count {
+        let sample_value = if (*running_sample_index / (square_wave_period / 2)) % 2 == 1 {
+            sound_volume
+        } else {
+            -sound_volume
+        };
+        *running_sample_index += 1;
+
+        *sample_out = sample_value;
+        sample_out = sample_out.add(1);
+        *sample_out = sample_value;
+        sample_out = sample_out.add(1);
+    }
+
+    buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
 }
 
 #[cfg(windows)]
@@ -328,7 +405,8 @@ fn main() -> Result<()> {
     unsafe {
         let device_context = GetDC(window);
 
-        let secondary_buffer = secondary_buffer_ptr.as_mut().unwrap();
+        let secondary_buffer = secondary_buffer_ptr.as_ref().unwrap();
+
         let mut sound_is_playing = false;
 
         RUNNING = true;
@@ -358,75 +436,14 @@ fn main() -> Result<()> {
                 }
             }
 
-            let mut play_cursor: DWORD = 0;
-            let mut write_cursor: DWORD = 0;
-            if secondary_buffer
-                .GetCurrentPosition(&mut play_cursor as *mut _, &mut write_cursor as *mut _)
-                != DS_OK
-            {
-                panic!("Failed to get current direct sound buffer position");
-            }
-
-            // Output sound
-            let byte_to_lock = (running_sample_index * bytes_per_sample) % sound_buffer_size;
-            let bytes_to_write = match byte_to_lock.cmp(&play_cursor) {
-                Ordering::Equal => sound_buffer_size,
-                Ordering::Greater => (sound_buffer_size - byte_to_lock) + play_cursor,
-                _ => play_cursor - byte_to_lock,
-            };
-
-            let mut region_1_ptr: LPVOID = ptr::null_mut();
-            let mut region_1_size: DWORD = 0;
-
-            let mut region_2_ptr: LPVOID = ptr::null_mut();
-            let mut region_2_size: DWORD = 0;
-
-            if secondary_buffer.Lock(
-                byte_to_lock,
-                bytes_to_write,
-                &mut region_1_ptr as *mut _,
-                &mut region_1_size as *mut _,
-                &mut region_2_ptr as *mut _,
-                &mut region_2_size as *mut _,
-                0,
-            ) != DS_OK
-            {
-                panic!("Failed to lock directsound buffer");
-            }
-
-            let mut sample_out = region_1_ptr as *mut i16;
-            let region_1_sample_count = region_1_size / bytes_per_sample;
-            for _ in 0..region_1_sample_count {
-                let sample_value = if (running_sample_index / (square_wave_period / 2)) % 2 == 1 {
-                    sound_volume
-                } else {
-                    -sound_volume
-                };
-                running_sample_index += 1;
-
-                *sample_out = sample_value;
-                sample_out = sample_out.add(1);
-                *sample_out = sample_value;
-                sample_out = sample_out.add(1);
-            }
-
-            sample_out = region_2_ptr as *mut i16;
-            let region_2_sample_count = region_2_size / bytes_per_sample;
-            for _ in 0..region_2_sample_count {
-                let sample_value = if (running_sample_index / (square_wave_period / 2)) % 2 == 1 {
-                    sound_volume
-                } else {
-                    -sound_volume
-                };
-                running_sample_index += 1;
-
-                *sample_out = sample_value;
-                sample_out = sample_out.add(1);
-                *sample_out = sample_value;
-                sample_out = sample_out.add(1);
-            }
-
-            secondary_buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
+            render_sound_to_buffer(
+                &secondary_buffer,
+                sound_buffer_size,
+                &mut running_sample_index,
+                bytes_per_sample,
+                sound_volume,
+                square_wave_period,
+            );
 
             if !sound_is_playing {
                 sound_is_playing = true;
@@ -443,11 +460,8 @@ fn main() -> Result<()> {
 
         ReleaseDC(window, device_context);
 
-        (direct_sound_ptr as LPUNKNOWN).as_mut().unwrap().Release();
-        (primary_buffer_ptr as LPUNKNOWN)
-            .as_mut()
-            .unwrap()
-            .Release();
+        (*direct_sound_ptr).Release();
+        (*primary_buffer_ptr).Release();
         secondary_buffer.Release();
 
         if DestroyWindow(window) == 0 {
