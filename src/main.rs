@@ -1,13 +1,7 @@
 #[macro_use]
 extern crate static_assertions;
 
-use std::{
-    f32,
-    ffi::OsStr,
-    io::{Error, Result},
-    mem::MaybeUninit,
-    ptr,
-};
+use std::{f32, ffi::OsStr, io, mem::MaybeUninit, ptr};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -16,7 +10,7 @@ use winapi::{
     shared::{minwindef::*, mmreg::*, windef::*, winerror::*},
     um::{
         cguid::*, debugapi::OutputDebugStringW, dsound::*, libloaderapi::GetModuleHandleW,
-        wingdi::*, winuser::*, xinput::*,
+        profileapi::*, wingdi::*, winnt::*, winuser::*, xinput::*,
     },
 };
 
@@ -150,7 +144,7 @@ struct WindowDimension {
 #[cfg(windows)]
 fn get_window_dimension(window: HWND) -> WindowDimension {
     let client_rect = unsafe {
-        let mut client_rect = MaybeUninit::<RECT>::uninit();
+        let mut client_rect = MaybeUninit::uninit();
         let success = GetClientRect(
             // Handle to relevant window
             window,
@@ -349,18 +343,7 @@ impl SoundOutput {
             )
         };
         if success != DS_OK {
-            eprintln!("{}", Error::last_os_error());
-            match success {
-                -2_005_401_450 => eprintln!("Buffer lost"),
-                -2_005_401_550 => eprintln!("Invalid call"),
-                -2_147_024_809 => eprintln!(
-                    "Invalid parameter with byte_to_lock = {} and byte_to_write = {}",
-                    byte_to_lock, bytes_to_write
-                ),
-                -2_005_401_530 => eprintln!("Priority level needed"),
-                _ => (),
-            }
-            eprintln!("Failed to lock DirectSound buffer");
+            // Failed to lock DirectSound buffer - this will happen if this function is called too often (currently only when building in release mode)
             return;
         }
 
@@ -419,7 +402,7 @@ unsafe extern "system" fn main_window_callback(
         WM_ACTIVATEAPP => OutputDebugStringW(win32_string("WM_ACTIVATEAPP").as_ptr()),
         WM_KEYUP | WM_KEYDOWN | WM_SYSKEYUP | WM_SYSKEYDOWN => handle_key_press(w_param, l_param),
         WM_PAINT => {
-            let mut paint = MaybeUninit::<PAINTSTRUCT>::uninit();
+            let mut paint = MaybeUninit::uninit();
             let device_context = BeginPaint(
                 // Window handle
                 window,
@@ -447,7 +430,40 @@ unsafe extern "system" fn main_window_callback(
 }
 
 #[cfg(windows)]
-fn main() -> Result<()> {
+fn get_performance_counter() -> io::Result<LARGE_INTEGER> {
+    unsafe {
+        let mut begin_counter = MaybeUninit::uninit();
+        if QueryPerformanceCounter(
+            // Out pointer for performance counter
+            begin_counter.as_mut_ptr(),
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(begin_counter.assume_init())
+    }
+}
+
+#[cfg(target_arch = "x86")]
+fn get_cycles() -> u64 {
+    unsafe { core::arch::x86::_rdtsc() }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn get_cycles() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(windows)]
+fn main() -> io::Result<()> {
+    let perf_counter_frequency = unsafe {
+        let mut perf_counter_frequency = MaybeUninit::uninit();
+        if QueryPerformanceFrequency(perf_counter_frequency.as_mut_ptr()) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *perf_counter_frequency.assume_init().QuadPart()
+    };
+
     let window_name = win32_string("HandmadeWindowClass");
     let title = win32_string("Handmade!");
 
@@ -515,7 +531,7 @@ fn main() -> Result<()> {
             ptr::null_mut(),
         );
         if window.is_null() {
-            return Err(Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
 
         // Get device constant assuming requires a valid window handle
@@ -570,10 +586,16 @@ fn main() -> Result<()> {
     }
 
     // Static can only be accessed from main thread
-    unsafe { RUNNING = true };
+    unsafe {
+        RUNNING = true;
+    }
+
+    let mut last_counter = get_performance_counter()?;
+    let mut last_cycle_count = get_cycles();
+
     while unsafe { RUNNING } {
-        let mut message = MaybeUninit::<MSG>::uninit();
         unsafe {
+            let mut message = MaybeUninit::uninit();
             while PeekMessageW(
                 // Out pointer for message
                 message.as_mut_ptr(),
@@ -600,7 +622,7 @@ fn main() -> Result<()> {
         // Handle gamepad input
         unsafe {
             for controller_index in 0..XUSER_MAX_COUNT {
-                let mut controller_state = MaybeUninit::<XINPUT_STATE>::uninit();
+                let mut controller_state = MaybeUninit::uninit();
                 if XInputGetState(
                     // Index of controller
                     controller_index,
@@ -663,6 +685,22 @@ fn main() -> Result<()> {
             // Static can only be accessed from main thread
             DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
         }
+
+        let end_counter = get_performance_counter()?;
+        let counter_elapsed = unsafe { end_counter.QuadPart() - last_counter.QuadPart() };
+        let time_elapsed_in_ms = (counter_elapsed * 1000) / perf_counter_frequency;
+        let fps = perf_counter_frequency / counter_elapsed;
+
+        let end_cycle_count = get_cycles();
+        let cycles_elapsed = end_cycle_count - last_cycle_count;
+        let million_cycles_per_frame = cycles_elapsed / 1_000_000;
+        println!(
+            "Draw frame in {} ms, {} fps, {} million cycles per frame",
+            time_elapsed_in_ms, fps, million_cycles_per_frame
+        );
+
+        last_counter = end_counter;
+        last_cycle_count = end_cycle_count;
     }
 
     // Cleanup
