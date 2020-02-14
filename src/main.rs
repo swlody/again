@@ -76,22 +76,36 @@ impl DisplayBuffer {
     }
 
     /// Requires that `device_context` is a valid device context and that info is valid
-    unsafe fn draw_to_window(&self, device_context: HDC, window_width: i32, window_height: i32) {
-        StretchDIBits(
-            device_context,
-            0,
-            0,
-            window_width,
-            window_height,
-            0,
-            0,
-            self.info.bmiHeader.biWidth,
-            self.info.bmiHeader.biHeight,
-            self.memory.as_ptr() as *const _,
-            &self.info as *const _,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
+    fn draw_to_window(&self, device_context: HDC, window_width: i32, window_height: i32) {
+        let success = unsafe {
+            StretchDIBits(
+                // Destination device context handle
+                device_context,
+                // Upper left corner of destination rectangle coords
+                0,
+                0,
+                // Dimensions of destination rectangle
+                window_width,
+                window_height,
+                // Source rectangle of image
+                0,
+                0,
+                // Dimensions of source image
+                self.info.bmiHeader.biWidth,
+                self.info.bmiHeader.biHeight,
+                // Memory buffer of image
+                self.memory.as_ptr() as *const _,
+                // Pointer to BITMAPINFO containing DIB information
+                &self.info as *const _,
+                // Image contains RGB values
+                DIB_RGB_COLORS,
+                // Copy source rectangle directly onto destination rectangle
+                SRCCOPY,
+            )
+        };
+        if success == 0 {
+            panic!("Failed to draw image to window");
+        }
     }
 }
 
@@ -135,10 +149,19 @@ struct WindowDimension {
 
 #[cfg(windows)]
 fn get_window_dimension(window: HWND) -> WindowDimension {
-    let mut client_rect = MaybeUninit::<RECT>::uninit();
-    unsafe { GetClientRect(window, client_rect.as_mut_ptr()) };
-
-    let client_rect = unsafe { client_rect.assume_init() };
+    let client_rect = unsafe {
+        let mut client_rect = MaybeUninit::<RECT>::uninit();
+        let success = GetClientRect(
+            // Handle to relevant window
+            window,
+            // Out pointer for client rect
+            client_rect.as_mut_ptr(),
+        );
+        if success == 0 {
+            panic!("Failed to get client rect");
+        }
+        client_rect.assume_init()
+    };
     WindowDimension {
         width: client_rect.right - client_rect.left,
         height: client_rect.bottom - client_rect.top,
@@ -166,6 +189,7 @@ unsafe fn handle_key_press(vk_code: WPARAM, l_param: LPARAM) {
 
 #[cfg(windows)]
 #[must_use]
+/// Guaranteed to return valid (non-null) pointers
 fn initialize_direct_sound(
     window: HWND,
     buffer_size: u32,
@@ -185,20 +209,19 @@ fn initialize_direct_sound(
     {
         panic!("Failed to create DirectSound");
     }
+    assert!(!direct_sound_ptr.is_null());
 
-    let direct_sound = unsafe {
-        let direct_sound = direct_sound_ptr.as_ref().unwrap();
-        if direct_sound.SetCooperativeLevel(
+    if unsafe {
+        (*direct_sound_ptr).SetCooperativeLevel(
             // window handle
             window,
             // flags
             DSSCL_PRIORITY,
-        ) != DS_OK
-        {
-            panic!("Failed to set DirectSound cooperative level")
-        }
-        direct_sound
-    };
+        )
+    } != DS_OK
+    {
+        panic!("Failed to set DirectSound cooperative level")
+    }
 
     let primary_buffer_description = DSBUFFERDESC {
         // Size of structure, in bytes
@@ -216,7 +239,7 @@ fn initialize_direct_sound(
     };
     let mut primary_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
     if unsafe {
-        direct_sound.CreateSoundBuffer(
+        (*direct_sound_ptr).CreateSoundBuffer(
             // DSBUFFERDESC object describing the buffer
             &primary_buffer_description as *const _,
             // Out pointer for allocated buffer
@@ -238,7 +261,7 @@ fn initialize_direct_sound(
         // product of channels and bits per sample divided by bits per byte
         let block_align = num_channels * bits_per_sample / BITS_PER_BYTE;
         // product of sample rate and block align
-        let avg_bytes_per_sec = samples_per_second * block_align as u32;
+        let avg_bytes_per_sec = samples_per_second * u32::from(block_align);
 
         WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM,
@@ -272,7 +295,7 @@ fn initialize_direct_sound(
     };
     let mut secondary_buffer_ptr: LPDIRECTSOUNDBUFFER = ptr::null_mut();
     if unsafe {
-        direct_sound.CreateSoundBuffer(
+        (*direct_sound_ptr).CreateSoundBuffer(
             // DSBUFFERDESC object describing the buffer
             &secondary_buffer_description as *const _,
             // Out pointer for allocated buffer
@@ -306,7 +329,7 @@ struct SoundOutput {
 impl SoundOutput {
     fn render_to_buffer(
         &mut self,
-        buffer: &IDirectSoundBuffer,
+        buffer: &mut IDirectSoundBuffer,
         byte_to_lock: u32,
         bytes_to_write: u32,
     ) {
@@ -314,7 +337,7 @@ impl SoundOutput {
         let mut region_1_size: DWORD = 0;
         let mut region_2_ptr: LPVOID = ptr::null_mut();
         let mut region_2_size: DWORD = 0;
-        let value = unsafe {
+        let success = unsafe {
             buffer.Lock(
                 byte_to_lock,
                 bytes_to_write,
@@ -325,18 +348,19 @@ impl SoundOutput {
                 0,
             )
         };
-        if value != DS_OK {
-            println!("{}", Error::last_os_error());
-            match value {
-                -2_005_401_450 => println!("Buffer lost"),
-                -2_005_401_550 => println!("Invalid call"),
-                -2_147_024_809 => {
-                    println!("Invalid parameter: {} {}", byte_to_lock, bytes_to_write)
-                }
-                -2_005_401_530 => println!("Priority level needed"),
+        if success != DS_OK {
+            eprintln!("{}", Error::last_os_error());
+            match success {
+                -2_005_401_450 => eprintln!("Buffer lost"),
+                -2_005_401_550 => eprintln!("Invalid call"),
+                -2_147_024_809 => eprintln!(
+                    "Invalid parameter with byte_to_lock = {} and byte_to_write = {}",
+                    byte_to_lock, bytes_to_write
+                ),
+                -2_005_401_530 => eprintln!("Priority level needed"),
                 _ => (),
             }
-            dbg!("Failed to lock DirectSound buffer");
+            eprintln!("Failed to lock DirectSound buffer");
             return;
         }
 
@@ -346,9 +370,9 @@ impl SoundOutput {
             let sample_value = (self.t_sin.sin() * self.volume) as i16;
 
             unsafe {
-                *sample_out = sample_value;
+                sample_out.write(sample_value);
                 sample_out = sample_out.add(1);
-                *sample_out = sample_value;
+                sample_out.write(sample_value);
                 sample_out = sample_out.add(1);
             }
 
@@ -362,9 +386,9 @@ impl SoundOutput {
             let sample_value = (self.t_sin.sin() * self.volume) as i16;
 
             unsafe {
-                *sample_out = sample_value;
+                sample_out.write(sample_value);
                 sample_out = sample_out.add(1);
-                *sample_out = sample_value;
+                sample_out.write(sample_value);
                 sample_out = sample_out.add(1);
             }
 
@@ -372,7 +396,9 @@ impl SoundOutput {
             self.running_sample_index = self.running_sample_index.wrapping_add(1);
         }
 
-        unsafe { buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size) };
+        unsafe {
+            buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
+        }
     }
 }
 
@@ -394,11 +420,24 @@ unsafe extern "system" fn main_window_callback(
         WM_KEYUP | WM_KEYDOWN | WM_SYSKEYUP | WM_SYSKEYDOWN => handle_key_press(w_param, l_param),
         WM_PAINT => {
             let mut paint = MaybeUninit::<PAINTSTRUCT>::uninit();
-            let device_context = BeginPaint(window, paint.as_mut_ptr());
+            let device_context = BeginPaint(
+                // Window handle
+                window,
+                // Out pointer for paint struct
+                paint.as_mut_ptr(),
+            );
+            if device_context.is_null() {
+                panic!("Could not begin paint");
+            }
             let paint = paint.assume_init();
             let dimension = get_window_dimension(window);
             DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
-            EndPaint(window, &paint as *const _);
+            EndPaint(
+                // Winow handle
+                window,
+                // Paint struct returned from BeginPaint call
+                &paint as *const _,
+            );
         }
 
         _ => result = DefWindowProcW(window, message, w_param, l_param),
@@ -419,39 +458,70 @@ fn main() -> Result<()> {
         )
     };
     let window_class = WNDCLASSW {
+        // Redraw if size changes
         style: CS_HREDRAW | CS_VREDRAW,
+        // Callback for the window procedure
         lpfnWndProc: Some(main_window_callback),
+        // Extra bytes to allocate after class structure
         cbClsExtra: 0,
+        // Extra bytes to allocate after window instance
         cbWndExtra: 0,
+        // Instance that contains the window procedure (this one)
         hInstance: hinstance,
+        // Handle to class icon - null for system default
         hIcon: ptr::null_mut(),
+        // Handle for class cursor - null for system default
         hCursor: ptr::null_mut(),
+        // Handle to class background brush - null for application to paint its own background
         hbrBackground: ptr::null_mut(),
+        // Class menu - null for none
         lpszMenuName: ptr::null(),
+        // Class name - must match following call to CreateWindowEx
         lpszClassName: window_name.as_ptr(),
     };
 
-    assert!(unsafe { RegisterClassW(&window_class) } != 0);
-    let window = unsafe {
-        CreateWindowExW(
-            0,
+    let (window, device_context) = unsafe {
+        if RegisterClassW(
+            // Pointer to WNDCLASS settings
+            &window_class,
+        ) == 0
+        {
+            panic!("Failed to register window class");
+        }
+        let window = CreateWindowExW(
+            // Default window style
+            WS_EX_LEFT,
+            // Must be same as lpszClassName of previous call to RegisterClassW
             window_name.as_ptr(),
+            // Title bar string
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            // Visible, tiled window
+            WS_TILEDWINDOW | WS_VISIBLE,
+            // Default horizontal position
             CW_USEDEFAULT,
+            // Default vertical position
             CW_USEDEFAULT,
+            // Default width
             CW_USEDEFAULT,
+            // Default height
             CW_USEDEFAULT,
+            // Parent window: null since no parent
             ptr::null_mut(),
+            // Child window identifier - null
             ptr::null_mut(),
+            // Instance of the module associated with the window
             hinstance,
+            // Initial message to be sent to the window - null for no additional data
             ptr::null_mut(),
-        )
-    };
+        );
+        if window.is_null() {
+            return Err(Error::last_os_error());
+        }
 
-    if window.is_null() {
-        return Err(Error::last_os_error());
-    }
+        // Get device constant assuming requires a valid window handle
+        let device_context = GetDC(window);
+        (window, device_context)
+    };
 
     let mut sound_output = {
         let volume = 4000.0;
@@ -462,9 +532,13 @@ fn main() -> Result<()> {
         SoundOutput {
             sample_rate,
             volume,
-            wave_period: f32::from(sample_rate) / f32::from(unsafe { HZ }),
+            wave_period: f32::from(sample_rate)
+                / f32::from(
+                    // Static can only be accessed from main thread
+                    unsafe { HZ },
+                ),
             buffer_size,
-            latency_sample_count: u32::from(sample_rate) / 60,
+            latency_sample_count: u32::from(sample_rate) / 15,
             bytes_per_sample,
             running_sample_index: 0,
             t_sin: 0.0,
@@ -478,20 +552,41 @@ fn main() -> Result<()> {
         u32::from(sound_output.sample_rate),
     );
 
+    let secondary_buffer = unsafe { secondary_buffer_ptr.as_mut().unwrap() };
+
+    let bytes_to_write =
+        sound_output.latency_sample_count * u32::from(sound_output.bytes_per_sample);
+    sound_output.render_to_buffer(secondary_buffer, 0, bytes_to_write);
     unsafe {
-        let device_context = GetDC(window);
+        // Begin playing secondary buffer
+        secondary_buffer.Play(
+            // Must be 0
+            0,
+            // Must be 0
+            0,
+            // Circular buffer: looping
+            DSBPLAY_LOOPING,
+        );
+    }
 
-        let secondary_buffer = secondary_buffer_ptr.as_ref().unwrap();
-
-        let bytes_to_write =
-            sound_output.latency_sample_count * u32::from(sound_output.bytes_per_sample);
-        sound_output.render_to_buffer(secondary_buffer, 0, bytes_to_write);
-        secondary_buffer.Play(0, 0, DSBPLAY_LOOPING);
-
-        RUNNING = true;
-        while RUNNING {
-            let mut message = MaybeUninit::<MSG>::uninit();
-            while PeekMessageW(message.as_mut_ptr(), ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+    // Static can only be accessed from main thread
+    unsafe { RUNNING = true };
+    while unsafe { RUNNING } {
+        let mut message = MaybeUninit::<MSG>::uninit();
+        unsafe {
+            while PeekMessageW(
+                // Out pointer for message
+                message.as_mut_ptr(),
+                // Null to receive all messages meant for current thread
+                ptr::null_mut(),
+                // Next two params 0 to receive all available messages
+                0,
+                0,
+                // Remove messages from queue after peek
+                PM_REMOVE,
+            ) != 0
+            {
+                // Non-zero return value means messages are available, so message is initialized
                 let message = message.assume_init();
                 if message.message == WM_QUIT {
                     RUNNING = false;
@@ -500,12 +595,20 @@ fn main() -> Result<()> {
                 TranslateMessage(&message as *const _);
                 DispatchMessageW(&message as *const _);
             }
+        }
 
-            // Handle gamepad input
+        // Handle gamepad input
+        unsafe {
             for controller_index in 0..XUSER_MAX_COUNT {
                 let mut controller_state = MaybeUninit::<XINPUT_STATE>::uninit();
-                if XInputGetState(controller_index, controller_state.as_mut_ptr()) == ERROR_SUCCESS
+                if XInputGetState(
+                    // Index of controller
+                    controller_index,
+                    // Out pointer for state to set
+                    controller_state.as_mut_ptr(),
+                ) == ERROR_SUCCESS
                 {
+                    // Function succeeded - state is initialized
                     let controller_state = controller_state.assume_init();
                     let pad = &controller_state.Gamepad;
                     let _up_pressed = (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0;
@@ -514,47 +617,71 @@ fn main() -> Result<()> {
                     // Controller not available
                 }
             }
-
-            // Render image
-            DISPLAY_BUFFER.step_render(1);
-
-            let mut play_cursor: DWORD = 0;
-            let mut write_cursor: DWORD = 0;
-            if secondary_buffer
-                .GetCurrentPosition(&mut play_cursor as *mut _, &mut write_cursor as *mut _)
-                != DS_OK
-            {
-                panic!("Failed to get current DirectSound buffer position");
-            }
-
-            let byte_to_lock = (sound_output.running_sample_index
-                * u32::from(sound_output.bytes_per_sample))
-                % sound_output.buffer_size;
-            let target_cursor = (play_cursor
-                + (sound_output.latency_sample_count * u32::from(sound_output.bytes_per_sample)))
-                % sound_output.buffer_size;
-            let bytes_to_write = if byte_to_lock > target_cursor {
-                sound_output.buffer_size - byte_to_lock + target_cursor
-            } else {
-                target_cursor - byte_to_lock
-            };
-
-            sound_output.wave_period = f32::from(sound_output.sample_rate) / f32::from(HZ);
-            sound_output.render_to_buffer(secondary_buffer, byte_to_lock, bytes_to_write);
-
-            // Draw image to window
-            let dimension = get_window_dimension(window);
-            DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
         }
 
-        ReleaseDC(window, device_context);
+        // Render image
+        unsafe {
+            // static should only be accessed from main thread
+            DISPLAY_BUFFER.step_render(1);
+        }
 
+        let mut play_cursor: DWORD = 0;
+        let mut write_cursor: DWORD = 0;
+
+        if {
+            unsafe {
+                secondary_buffer.GetCurrentPosition(
+                    // Out pointer for play cursor
+                    &mut play_cursor as *mut _,
+                    // Out pointer for write cursor
+                    &mut write_cursor as *mut _,
+                )
+            }
+        } != DS_OK
+        {
+            panic!("Failed to get current DirectSound buffer position");
+        }
+
+        let byte_to_lock = (sound_output.running_sample_index
+            * u32::from(sound_output.bytes_per_sample))
+            % sound_output.buffer_size;
+        let target_cursor = (play_cursor
+            + (sound_output.latency_sample_count * u32::from(sound_output.bytes_per_sample)))
+            % sound_output.buffer_size;
+        let bytes_to_write = if byte_to_lock > target_cursor {
+            sound_output.buffer_size - byte_to_lock + target_cursor
+        } else {
+            target_cursor - byte_to_lock
+        };
+
+        sound_output.wave_period = f32::from(sound_output.sample_rate) / f32::from(unsafe { HZ });
+        sound_output.render_to_buffer(secondary_buffer, byte_to_lock, bytes_to_write);
+
+        // Draw image to window
+        let dimension = get_window_dimension(window);
+        unsafe {
+            // Static can only be accessed from main thread
+            DISPLAY_BUFFER.draw_to_window(device_context, dimension.width, dimension.height);
+        }
+    }
+
+    // Cleanup
+    unsafe {
+        ReleaseDC(
+            // Window handle
+            window,
+            // Device context for given window handle
+            device_context,
+        );
+
+        // Release buffers to free allocated memory
         (*direct_sound_ptr).Release();
         (*primary_buffer_ptr).Release();
         secondary_buffer.Release();
 
+        // Destroy given window handle
         if DestroyWindow(window) == 0 {
-            dbg!("Failed to destroy window");
+            eprintln!("Failed to destroy window");
         }
     }
 
