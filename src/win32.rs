@@ -4,8 +4,8 @@ use std::os::windows::ffi::OsStrExt;
 use winapi::{
     shared::{minwindef::*, mmreg::*, windef::*, winerror::*},
     um::{
-        cguid::*, debugapi::OutputDebugStringW, dsound::*, libloaderapi::GetModuleHandleW,
-        profileapi::*, wingdi::*, winnt::*, winuser::*, xinput::*,
+        cguid::*, dsound::*, libloaderapi::GetModuleHandleW, profileapi::*, wingdi::*, winnt::*,
+        winuser::*, xinput::*,
     },
 };
 
@@ -251,6 +251,7 @@ struct SoundOutput {
     buffer_size: u32,
     running_sample_index: u32,
     latency_sample_count: u32,
+    channel_count: u16,
     sample_rate: u16,
     bytes_per_sample: u16,
 }
@@ -261,8 +262,8 @@ impl SoundOutput {
         let mut region_1_size: DWORD = 0;
         let mut region_2_ptr: LPVOID = ptr::null_mut();
         let mut region_2_size: DWORD = 0;
-        let success = unsafe {
-            destination_buffer.Lock(
+        unsafe {
+            if destination_buffer.Lock(
                 0,
                 self.buffer_size,
                 &mut region_1_ptr as *mut _,
@@ -270,29 +271,14 @@ impl SoundOutput {
                 &mut region_2_ptr as *mut _,
                 &mut region_2_size as *mut _,
                 0,
-            )
-        };
-        if success != DS_OK {
-            return;
-        }
-
-        let mut destination_sample = region_1_ptr as *mut u8;
-        for _ in 0..region_1_size {
-            unsafe {
-                destination_sample.write(0);
-                destination_sample = destination_sample.add(1);
+            ) != DS_OK
+            {
+                panic!("Failed to lock DirectSound buffer for clear");
             }
-        }
 
-        destination_sample = region_2_ptr as *mut u8;
-        for _ in 0..region_2_size {
-            unsafe {
-                destination_sample.write(0);
-                destination_sample = destination_sample.add(1);
-            }
-        }
+            ptr::write_bytes(region_1_ptr as *mut _, 0, region_1_size as usize);
+            ptr::write_bytes(region_2_ptr as *mut _, 0, region_2_size as usize);
 
-        unsafe {
             destination_buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
         }
     }
@@ -308,8 +294,8 @@ impl SoundOutput {
         let mut region_1_size: DWORD = 0;
         let mut region_2_ptr: LPVOID = ptr::null_mut();
         let mut region_2_size: DWORD = 0;
-        let success = unsafe {
-            destination_buffer.Lock(
+        unsafe {
+            if destination_buffer.Lock(
                 byte_to_lock,
                 bytes_to_write,
                 &mut region_1_ptr as *mut _,
@@ -317,42 +303,37 @@ impl SoundOutput {
                 &mut region_2_ptr as *mut _,
                 &mut region_2_size as *mut _,
                 0,
-            )
-        };
-        if success != DS_OK {
-            // Failed to lock DirectSound buffer - this will happen if this function is called too often (currently only when building in release mode)
-            return;
-        }
-
-        let region_1_sample_count = region_1_size as usize / self.bytes_per_sample as usize;
-        let mut destination_sample = region_1_ptr as *mut i16;
-        for i in (0..region_1_sample_count * 2).step_by(2) {
-            unsafe {
-                destination_sample.write(source_buffer.samples[i]);
-                destination_sample = destination_sample.add(1);
-
-                destination_sample.write(source_buffer.samples[i + 1]);
-                destination_sample = destination_sample.add(1);
+            ) != DS_OK
+            {
+                // Failed to lock DirectSound buffer - this will happen if this function is called too often (currently only when building in release mode)
+                return;
             }
 
-            self.running_sample_index += 1;
-        }
+            let region_1_sample_count = region_1_size / std::mem::size_of::<i16>() as u32;
+            let region_2_sample_count = region_2_size / std::mem::size_of::<i16>() as u32;
 
-        let region_2_sample_count = region_2_size as usize / self.bytes_per_sample as usize;
-        destination_sample = region_2_ptr as *mut i16;
-        for i in (0..region_2_sample_count * 2).step_by(2) {
-            unsafe {
-                destination_sample.write(source_buffer.samples[i]);
-                destination_sample = destination_sample.add(1);
+            assert!(
+                region_1_sample_count as usize + region_2_sample_count as usize
+                    <= source_buffer.samples.len()
+            );
 
-                destination_sample.write(source_buffer.samples[i + 1]);
-                destination_sample = destination_sample.add(1);
-            }
+            ptr::copy_nonoverlapping(
+                source_buffer.samples.as_ptr(),
+                region_1_ptr as *mut _,
+                region_1_sample_count as usize,
+            );
+            ptr::copy_nonoverlapping(
+                source_buffer
+                    .samples
+                    .as_ptr()
+                    .add(region_1_sample_count as usize),
+                region_2_ptr as *mut _,
+                region_2_sample_count as usize,
+            );
 
-            self.running_sample_index += 1;
-        }
+            self.running_sample_index += region_1_sample_count / u32::from(self.channel_count)
+                + region_2_sample_count / u32::from(self.channel_count);
 
-        unsafe {
             destination_buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
         }
     }
@@ -400,9 +381,7 @@ unsafe extern "system" fn main_window_callback(
 
     let mut result = 0;
     match message {
-        WM_SIZE => OutputDebugStringW(win32_string("WM_SIZE").as_ptr()),
         WM_CLOSE | WM_DESTROY => RUNNING = false,
-        WM_ACTIVATEAPP => OutputDebugStringW(win32_string("WM_ACTIVATEAPP").as_ptr()),
         WM_KEYUP | WM_KEYDOWN | WM_SYSKEYUP | WM_SYSKEYDOWN => handle_key_press(w_param, l_param),
         WM_PAINT => {
             let mut paint = MaybeUninit::uninit();
@@ -549,10 +528,12 @@ pub fn win32_main() -> io::Result<()> {
 
     let mut sound_output = {
         let sample_rate = 48000;
-        let bytes_per_sample = std::mem::size_of::<WORD>() as u16 * 2;
+        let channel_count = 2;
+        let bytes_per_sample = std::mem::size_of::<WORD>() as u16 * channel_count;
         let buffer_size = u32::from(sample_rate) * u32::from(bytes_per_sample);
 
         SoundOutput {
+            channel_count,
             sample_rate,
             buffer_size,
             latency_sample_count: u32::from(sample_rate) / 15,

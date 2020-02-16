@@ -43,6 +43,7 @@ impl SoundBuffer {
     fn render_sound(&mut self, tone_hz: u16) {
         let wave_period = f32::from(self.sample_rate) / f32::from(tone_hz);
 
+        // TODO(sawlody) `2` is the number of channels - should be put in a variable
         for i in (0..self.sample_count * 2).step_by(2) {
             let sample_value = (self.t_sin.sin() * self.volume) as i16;
 
