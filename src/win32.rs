@@ -1,4 +1,4 @@
-use std::{f32, ffi::OsStr, io, mem::MaybeUninit, ptr};
+use std::{ffi::OsStr, io, mem::MaybeUninit, ptr};
 
 use std::os::windows::ffi::OsStrExt;
 use winapi::{
@@ -76,37 +76,6 @@ impl DisplayBuffer {
         }
     }
 }
-
-const_assert!(std::mem::size_of::<BITMAPINFOHEADER>() < u32::max_value() as usize);
-
-static mut DISPLAY_BUFFER: DisplayBuffer = DisplayBuffer {
-    memory: Vec::new(),
-    current_offset: 0,
-    width: 1280,
-    height: 720,
-};
-
-static mut BITMAP_INFO: BITMAPINFO = BITMAPINFO {
-    bmiHeader: BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: 0,
-        biHeight: 0,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB,
-        biSizeImage: 0,
-        biXPelsPerMeter: 0,
-        biYPelsPerMeter: 0,
-        biClrUsed: 0,
-        biClrImportant: 0,
-    },
-    bmiColors: [RGBQUAD {
-        rgbBlue: 0,
-        rgbGreen: 0,
-        rgbRed: 0,
-        rgbReserved: 0,
-    }],
-};
 
 static mut RUNNING: bool = false;
 
@@ -279,20 +248,59 @@ fn initialize_direct_sound(
 }
 
 struct SoundOutput {
-    volume: f32,
-    wave_period: f32,
-    t_sin: f32,
-    running_sample_index: u32,
     buffer_size: u32,
+    running_sample_index: u32,
     latency_sample_count: u32,
     sample_rate: u16,
-    bytes_per_sample: u8,
+    bytes_per_sample: u16,
 }
 
 impl SoundOutput {
-    fn render_to_buffer(
+    fn clear_buffer(&self, destination_buffer: &mut IDirectSoundBuffer) {
+        let mut region_1_ptr: LPVOID = ptr::null_mut();
+        let mut region_1_size: DWORD = 0;
+        let mut region_2_ptr: LPVOID = ptr::null_mut();
+        let mut region_2_size: DWORD = 0;
+        let success = unsafe {
+            destination_buffer.Lock(
+                0,
+                self.buffer_size,
+                &mut region_1_ptr as *mut _,
+                &mut region_1_size as *mut _,
+                &mut region_2_ptr as *mut _,
+                &mut region_2_size as *mut _,
+                0,
+            )
+        };
+        if success != DS_OK {
+            return;
+        }
+
+        let mut destination_sample = region_1_ptr as *mut u8;
+        for _ in 0..region_1_size {
+            unsafe {
+                destination_sample.write(0);
+                destination_sample = destination_sample.add(1);
+            }
+        }
+
+        destination_sample = region_2_ptr as *mut u8;
+        for _ in 0..region_2_size {
+            unsafe {
+                destination_sample.write(0);
+                destination_sample = destination_sample.add(1);
+            }
+        }
+
+        unsafe {
+            destination_buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
+        }
+    }
+
+    fn fill_buffer(
         &mut self,
-        buffer: &mut IDirectSoundBuffer,
+        destination_buffer: &mut IDirectSoundBuffer,
+        source_buffer: &SoundBuffer,
         byte_to_lock: u32,
         bytes_to_write: u32,
     ) {
@@ -301,7 +309,7 @@ impl SoundOutput {
         let mut region_2_ptr: LPVOID = ptr::null_mut();
         let mut region_2_size: DWORD = 0;
         let success = unsafe {
-            buffer.Lock(
+            destination_buffer.Lock(
                 byte_to_lock,
                 bytes_to_write,
                 &mut region_1_ptr as *mut _,
@@ -316,43 +324,70 @@ impl SoundOutput {
             return;
         }
 
-        let mut sample_out = region_1_ptr as *mut i16;
-        let region_1_sample_count = region_1_size / u32::from(self.bytes_per_sample);
-        for _ in 0..region_1_sample_count {
-            let sample_value = (self.t_sin.sin() * self.volume) as i16;
-
+        let region_1_sample_count = region_1_size as usize / self.bytes_per_sample as usize;
+        let mut destination_sample = region_1_ptr as *mut i16;
+        for i in (0..region_1_sample_count * 2).step_by(2) {
             unsafe {
-                sample_out.write(sample_value);
-                sample_out = sample_out.add(1);
-                sample_out.write(sample_value);
-                sample_out = sample_out.add(1);
+                destination_sample.write(source_buffer.samples[i]);
+                destination_sample = destination_sample.add(1);
+
+                destination_sample.write(source_buffer.samples[i + 1]);
+                destination_sample = destination_sample.add(1);
             }
 
-            self.t_sin += 2.0 * f32::consts::PI * 1.0 / self.wave_period;
-            self.running_sample_index = self.running_sample_index.wrapping_add(1);
+            self.running_sample_index += 1;
         }
 
-        sample_out = region_2_ptr as *mut i16;
-        let region_2_sample_count = region_2_size / u32::from(self.bytes_per_sample);
-        for _ in 0..region_2_sample_count {
-            let sample_value = (self.t_sin.sin() * self.volume) as i16;
-
+        let region_2_sample_count = region_2_size as usize / self.bytes_per_sample as usize;
+        destination_sample = region_2_ptr as *mut i16;
+        for i in (0..region_2_sample_count * 2).step_by(2) {
             unsafe {
-                sample_out.write(sample_value);
-                sample_out = sample_out.add(1);
-                sample_out.write(sample_value);
-                sample_out = sample_out.add(1);
+                destination_sample.write(source_buffer.samples[i]);
+                destination_sample = destination_sample.add(1);
+
+                destination_sample.write(source_buffer.samples[i + 1]);
+                destination_sample = destination_sample.add(1);
             }
 
-            self.t_sin += 2.0 * f32::consts::PI * 1.0 / self.wave_period;
-            self.running_sample_index = self.running_sample_index.wrapping_add(1);
+            self.running_sample_index += 1;
         }
 
         unsafe {
-            buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
+            destination_buffer.Unlock(region_1_ptr, region_1_size, region_2_ptr, region_2_size);
         }
     }
 }
+
+const_assert!(std::mem::size_of::<BITMAPINFOHEADER>() < u32::max_value() as usize);
+
+static mut DISPLAY_BUFFER: DisplayBuffer = DisplayBuffer {
+    memory: Vec::new(),
+    current_offset: 0,
+    width: 1280,
+    height: 720,
+};
+
+static mut BITMAP_INFO: BITMAPINFO = BITMAPINFO {
+    bmiHeader: BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: 0,
+        biHeight: 0,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        biSizeImage: 0,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    },
+    bmiColors: [RGBQUAD {
+        rgbBlue: 0,
+        rgbGreen: 0,
+        rgbRed: 0,
+        rgbReserved: 0,
+    }],
+};
 
 /// `unsafe` precondition: must be called from main thread
 unsafe extern "system" fn main_window_callback(
@@ -428,6 +463,7 @@ fn get_cycles() -> u64 {
 }
 
 pub fn win32_main() -> io::Result<()> {
+    #[allow(unused_variables)]
     let perf_counter_frequency = unsafe {
         let mut perf_counter_frequency = MaybeUninit::uninit();
         if QueryPerformanceFrequency(perf_counter_frequency.as_mut_ptr()) == 0 {
@@ -512,24 +548,16 @@ pub fn win32_main() -> io::Result<()> {
     };
 
     let mut sound_output = {
-        let volume = 4000.0;
         let sample_rate = 48000;
-        let bytes_per_sample = std::mem::size_of::<WORD>() as u8 * 2;
+        let bytes_per_sample = std::mem::size_of::<WORD>() as u16 * 2;
         let buffer_size = u32::from(sample_rate) * u32::from(bytes_per_sample);
 
         SoundOutput {
             sample_rate,
-            volume,
-            wave_period: f32::from(sample_rate)
-                / f32::from(
-                    // Static can only be accessed from main thread
-                    unsafe { HZ },
-                ),
             buffer_size,
             latency_sample_count: u32::from(sample_rate) / 15,
             bytes_per_sample,
             running_sample_index: 0,
-            t_sin: 0.0,
         }
     };
 
@@ -541,10 +569,7 @@ pub fn win32_main() -> io::Result<()> {
     );
 
     let secondary_buffer = unsafe { secondary_buffer_ptr.as_mut().unwrap() };
-
-    let bytes_to_write =
-        sound_output.latency_sample_count * u32::from(sound_output.bytes_per_sample);
-    sound_output.render_to_buffer(secondary_buffer, 0, bytes_to_write);
+    sound_output.clear_buffer(secondary_buffer);
     unsafe {
         // Begin playing secondary buffer
         secondary_buffer.Play(
@@ -562,7 +587,17 @@ pub fn win32_main() -> io::Result<()> {
         RUNNING = true;
     }
 
+    let mut sound_buffer = SoundBuffer {
+        samples: vec![0; sound_output.buffer_size as usize],
+        sample_count: 0,
+        t_sin: 0.0,
+        volume: 4000.0,
+        sample_rate: sound_output.sample_rate,
+    };
+
+    #[allow(unused_mut, unused_variables)]
     let mut last_counter = get_performance_counter()?;
+    #[allow(unused_mut, unused_variables)]
     let mut last_cycle_count = get_cycles();
 
     while unsafe { RUNNING } {
@@ -613,13 +648,8 @@ pub fn win32_main() -> io::Result<()> {
             }
         }
 
-        // Render image
-        // static should only be accessed from main thread
-        update_and_render(unsafe { &mut DISPLAY_BUFFER });
-
         let mut play_cursor: DWORD = 0;
         let mut write_cursor: DWORD = 0;
-
         if {
             unsafe {
                 secondary_buffer.GetCurrentPosition(
@@ -633,7 +663,6 @@ pub fn win32_main() -> io::Result<()> {
         {
             panic!("Failed to get current DirectSound buffer position");
         }
-
         let byte_to_lock = (sound_output.running_sample_index
             * u32::from(sound_output.bytes_per_sample))
             % sound_output.buffer_size;
@@ -646,8 +675,21 @@ pub fn win32_main() -> io::Result<()> {
             target_cursor - byte_to_lock
         };
 
-        sound_output.wave_period = f32::from(sound_output.sample_rate) / f32::from(unsafe { HZ });
-        sound_output.render_to_buffer(secondary_buffer, byte_to_lock, bytes_to_write);
+        sound_buffer.sample_count =
+            bytes_to_write as usize / sound_output.bytes_per_sample as usize;
+        update_and_render(
+            // static should only be accessed from main thread
+            unsafe { &mut DISPLAY_BUFFER },
+            &mut sound_buffer,
+            unsafe { HZ },
+        );
+
+        sound_output.fill_buffer(
+            secondary_buffer,
+            &sound_buffer,
+            byte_to_lock,
+            bytes_to_write,
+        );
 
         // Draw image to window
         let dimension = get_window_dimension(window);
@@ -662,20 +704,23 @@ pub fn win32_main() -> io::Result<()> {
         }
 
         let end_counter = get_performance_counter()?;
-        let counter_elapsed = unsafe { end_counter.QuadPart() - last_counter.QuadPart() };
-        let time_elapsed_in_ms = (counter_elapsed * 1000) / perf_counter_frequency;
-        let fps = perf_counter_frequency / counter_elapsed;
+        // let counter_elapsed = unsafe { end_counter.QuadPart() - last_counter.QuadPart() };
+        // let time_elapsed_in_ms = (counter_elapsed * 1000) / perf_counter_frequency;
+        // let fps = perf_counter_frequency / counter_elapsed;
 
         let end_cycle_count = get_cycles();
-        let cycles_elapsed = end_cycle_count - last_cycle_count;
-        let million_cycles_per_frame = cycles_elapsed / 1_000_000;
-        println!(
-            "Draw frame in {} ms, {} fps, {} million cycles per frame",
-            time_elapsed_in_ms, fps, million_cycles_per_frame
-        );
+        // let cycles_elapsed = end_cycle_count - last_cycle_count;
+        // let million_cycles_per_frame = cycles_elapsed / 1_000_000;
+        // println!(
+        //     "Draw frame in {} ms, {} fps, {} million cycles per frame",
+        //     time_elapsed_in_ms, fps, million_cycles_per_frame
+        // );
 
-        last_counter = end_counter;
-        last_cycle_count = end_cycle_count;
+        #[allow(unused_assignments)]
+        {
+            last_counter = end_counter;
+            last_cycle_count = end_cycle_count;
+        }
     }
 
     // Cleanup
